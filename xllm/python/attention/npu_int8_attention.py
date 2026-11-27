@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch_npu
 from xllm_kernel.ops.kv_cache import reshape_paged_cache
 from xllm_kernel.ops.quantization import dynamic_quant
 
@@ -13,6 +14,7 @@ from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.npu_paged_attention import SPARSE_MODE_RIGHT_DOWN_CAUSAL, NpuPagedAttentionBackend
 
 if TYPE_CHECKING:
+    from xllm.python.attention.backend import AttentionMetadata
     from xllm.python.layers.attention import Attention
 
 
@@ -36,6 +38,17 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
             ):
                 raise ValueError("INT8 GQA requires FP32 scale pages shaped [block, head, token]")
 
+    def prepare(self, metadata: AttentionMetadata, *, graph_mode: bool = False) -> None:
+        super().prepare(metadata, graph_mode=graph_mode)
+        slots = self._full_slot_mapping(metadata)
+        rows = torch.where(slots >= 0)[0]
+        self._scale_rows = None if rows.numel() == slots.numel() else rows
+        live_slots = slots if self._scale_rows is None else slots.index_select(0, rows)
+        # Reuse physical [block, head, token] addresses for every GQA layer.
+        head_offsets = torch.arange(self.num_kv_heads, dtype=slots.dtype, device=slots.device) * self.page_size
+        first_head = live_slots + (live_slots // self.page_size) * ((self.num_kv_heads - 1) * self.page_size)
+        self._scale_indices = (first_head[:, None] + head_offsets).reshape(-1, 1)
+
     def execute(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: Attention) -> torch.Tensor:
         metadata = self._metadata
         assert metadata is not None
@@ -47,10 +60,12 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
         key_int8, key_scale = dynamic_quant(key.contiguous())
         value_int8, value_scale = dynamic_quant(value.contiguous())
         reshape_paged_cache(slots, key_int8, value_int8, cache.key, cache.value)
-        live = torch.where(slots >= 0)[0]
-        pages, offsets = slots[live] // self.page_size, slots[live] % self.page_size
-        cache.key_scale[pages, :, offsets] = key_scale[live]
-        cache.value_scale[pages, :, offsets] = value_scale[live]
+        if self._scale_indices.numel():
+            if self._scale_rows is not None:
+                key_scale = key_scale.index_select(0, self._scale_rows)
+                value_scale = value_scale.index_select(0, self._scale_rows)
+            torch_npu.npu_scatter_nd_update_(cache.key_scale.view(-1), self._scale_indices, key_scale.flatten())
+            torch_npu.npu_scatter_nd_update_(cache.value_scale.view(-1), self._scale_indices, value_scale.flatten())
 
         if metadata.is_prefill:
             # The whole prompt is present in model precision before the first decode.
