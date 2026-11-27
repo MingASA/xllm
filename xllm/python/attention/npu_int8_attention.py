@@ -6,18 +6,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from xllm_kernel.ops.kv_cache import write_int8_kv
+import torch_npu
+from xllm_kernel.ops.kv_cache import reshape_paged_cache, write_int8_kv
+from xllm_kernel.ops.quantization import dynamic_quant
 
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.npu_paged_attention import SPARSE_MODE_RIGHT_DOWN_CAUSAL, NpuPagedAttentionBackend
 
 if TYPE_CHECKING:
+    from xllm.python.attention.backend import AttentionMetadata
     from xllm.python.layers.attention import Attention
 
 
 class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         super().bind_kv_caches(kv_caches)
+        self._bulk_indices: tuple[torch.Tensor | None, torch.Tensor] | None = None
         if not 32 <= self.page_size <= 512 or self.page_size % 32:
             raise ValueError("INT8 paged FIA requires a page size divisible by 32 and at most 512")
         for cache in kv_caches:
@@ -39,6 +43,21 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
             ):
                 raise ValueError("INT8 GQA requires contiguous FP32 scale pages shaped [block, head, token]")
 
+    def prepare(self, metadata: AttentionMetadata, *, graph_mode: bool = False) -> None:
+        super().prepare(metadata, graph_mode=graph_mode)
+        self._bulk_indices = None
+        slots = self._full_slot_mapping(metadata)
+        # At 4096 token/head rows CANN's bulk quantization overtakes the scalar scatter.
+        if metadata.is_prefill and slots.numel() * self.num_kv_heads >= 4096:
+            live = torch.where(slots >= 0)[0]
+            if live.numel() == slots.numel():
+                live = None
+            else:
+                slots = slots.index_select(0, live)
+            heads = torch.arange(self.num_kv_heads, device=slots.device, dtype=slots.dtype)
+            first = slots + (slots // self.page_size) * ((self.num_kv_heads - 1) * self.page_size)
+            self._bulk_indices = live, (first[:, None] + heads * self.page_size).reshape(-1).int()
+
     def execute(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: Attention) -> torch.Tensor:
         metadata = self._metadata
         assert metadata is not None
@@ -48,9 +67,31 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
         value = v.view_as(key)
         key_pages = cache.key.transpose(1, 2)
         value_pages = cache.value.transpose(1, 2)
-        write_int8_kv(
-            key, value, self._full_slot_mapping(metadata), key_pages, value_pages, cache.key_scale, cache.value_scale
-        )
+        if self._bulk_indices is None:
+            write_int8_kv(
+                key,
+                value,
+                self._full_slot_mapping(metadata),
+                key_pages,
+                value_pages,
+                cache.key_scale,
+                cache.value_scale,
+            )
+        else:
+            live, indices = self._bulk_indices
+            key, value = key.contiguous(), value.contiguous()
+            if indices.numel():
+                ki, ks = dynamic_quant(key if live is None else key.index_select(0, live))
+                vi, vs = dynamic_quant(value if live is None else value.index_select(0, live))
+                reshape_paged_cache(
+                    indices,
+                    ki.view(-1, 1, self.head_dim),
+                    vi.view(-1, 1, self.head_dim),
+                    key_pages.view(-1, self.page_size, 1, self.head_dim),
+                    value_pages.view(-1, self.page_size, 1, self.head_dim),
+                )
+                torch_npu.npu_scatter_nd_update_(cache.key_scale.view(-1), indices[:, None], ks.flatten())
+                torch_npu.npu_scatter_nd_update_(cache.value_scale.view(-1), indices[:, None], vs.flatten())
 
         if metadata.is_prefill:
             # The whole prompt is present in model precision before the first decode.

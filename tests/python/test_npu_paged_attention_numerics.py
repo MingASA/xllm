@@ -1576,16 +1576,20 @@ def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
 
     device = torch.device("npu:0")
     heads, kv_heads, page = 24, 4, 128
+    lengths = [132, 73] if dimension == 128 else [768, 260]
+    pages_per_row = [length // page + 1 for length in lengths]
+    num_pages = 1 + sum(pages_per_row)
+    rng = torch.Generator().manual_seed(2026)
+    physical = iter((torch.randperm(num_pages - 1, generator=rng) + 1).tolist())
+    blocks = [[next(physical) for _ in range(n)] + [0] * (max(pages_per_row) - n) for n in pages_per_row]
     backend = NpuInt8AttentionBackend(heads, kv_heads, dimension, dimension**-0.5, 0, False, device, torch.bfloat16)
     caches = [
-        torch.full((6, kv_heads, page, dimension), -11, dtype=torch.int8, device=device).transpose(1, 2)
+        torch.full((num_pages, kv_heads, page, dimension), -11, dtype=torch.int8, device=device).transpose(1, 2)
         for _ in range(2)
     ]
-    scales = [torch.full((6, kv_heads, page), -11.0, device=device) for _ in range(2)]
+    scales = [torch.full((num_pages, kv_heads, page), -11.0, device=device) for _ in range(2)]
     backend.bind_kv_caches([LayerCache(*caches, key_scale=scales[0], value_scale=scales[1])])
-    blocks = [[4, 2], [3, 1]]
     layer = SimpleNamespace(layer_id=0)
-    rng = torch.Generator().manual_seed(2026)
 
     def step(counts: list[int], lengths: list[int], prefill: bool) -> tuple[torch.Tensor, ...]:
         slots = [
@@ -1613,7 +1617,6 @@ def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
         output = backend.execute(query.flatten(1), key.flatten(1), value.flatten(1), layer)
         return *(tensor.float().cpu() for tensor in (query, key, value)), output.view_as(query).float().cpu()
 
-    lengths = [132, 73]
     _, keys, values, prefill_output = step(lengths, lengths, True)
     query, new_keys, new_values, decode_output = step([1, 1], [length + 1 for length in lengths], False)
     start = 0
