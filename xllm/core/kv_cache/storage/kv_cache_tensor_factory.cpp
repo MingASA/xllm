@@ -359,6 +359,17 @@ QuantizedKVCacheTensors create_quantized_kv_cache_tensors(
   tensors.kv_cache_tensors =
       create_kv_cache_tensors(kv_cache_shape, quantized_options);
 
+#if defined(USE_NPU)
+  // Keep the framework's [block, token, head, dim] views. FIA reads the
+  // underlying contiguous [block, head, token, dim] pages without a copy.
+  for (auto* cache : {&tensors.kv_cache_tensors.key_cache,
+                      &tensors.kv_cache_tensors.value_cache}) {
+    const auto shape = cache->sizes();
+    CHECK_EQ(shape.size(), 4);
+    *cache =
+        cache->view({shape[0], shape[2], shape[1], shape[3]}).transpose(1, 2);
+  }
+#endif
   auto allocate_scale = [&](KVCacheTensorRole role,
                             const std::vector<int64_t>& page_shape) {
     std::vector<int64_t> shape(page_shape.begin(), page_shape.end() - 1);

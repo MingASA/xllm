@@ -1577,7 +1577,10 @@ def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
     device = torch.device("npu:0")
     heads, kv_heads, page = 24, 4, 128
     backend = NpuInt8AttentionBackend(heads, kv_heads, dimension, dimension**-0.5, 0, False, device, torch.bfloat16)
-    caches = [torch.full((6, page, kv_heads, dimension), -11, dtype=torch.int8, device=device) for _ in range(2)]
+    caches = [
+        torch.full((6, kv_heads, page, dimension), -11, dtype=torch.int8, device=device).transpose(1, 2)
+        for _ in range(2)
+    ]
     scales = [torch.full((6, kv_heads, page), -11.0, device=device) for _ in range(2)]
     backend.bind_kv_caches([LayerCache(*caches, key_scale=scales[0], value_scale=scales[1])])
     blocks = [[4, 2], [3, 1]]

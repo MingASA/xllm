@@ -28,9 +28,13 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
                 continue
             expected = (self.num_kv_blocks, self.page_size, self.num_kv_heads, self.head_dim)
             if any(
-                page is None or page.dtype != torch.int8 or page.shape != expected for page in (cache.key, cache.value)
+                page is None
+                or page.dtype != torch.int8
+                or page.shape != expected
+                or not page.transpose(1, 2).is_contiguous()
+                for page in (cache.key, cache.value)
             ):
-                raise ValueError("INT8 GQA requires matching signed INT8 K/V pages")
+                raise ValueError("INT8 GQA requires head-major signed INT8 K/V pages")
             scale_shape = (self.num_kv_blocks, self.num_kv_heads, self.page_size)
             if any(
                 scale is None or scale.dtype != torch.float32 or scale.shape != scale_shape
@@ -43,11 +47,16 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
         slots = self._full_slot_mapping(metadata)
         rows = torch.where(slots >= 0)[0]
         self._scale_rows = None if rows.numel() == slots.numel() else rows
-        live_slots = slots if self._scale_rows is None else slots.index_select(0, rows)
-        # Reuse physical [block, head, token] addresses for every GQA layer.
+        # Each head occupies one contiguous physical page for both values and scales.
         head_offsets = torch.arange(self.num_kv_heads, dtype=slots.dtype, device=slots.device) * self.page_size
-        first_head = live_slots + (live_slots // self.page_size) * ((self.num_kv_heads - 1) * self.page_size)
-        self._scale_indices = (first_head[:, None] + head_offsets).reshape(-1, 1)
+        first_head = slots + (slots // self.page_size) * ((self.num_kv_heads - 1) * self.page_size)
+        addresses = first_head[:, None] + head_offsets
+        if self._scale_rows is None:
+            self._write_slots = addresses.flatten()
+            self._scale_indices = self._write_slots.view(-1, 1)
+        else:
+            self._write_slots = torch.where(slots[:, None] >= 0, addresses, -1).flatten()
+            self._scale_indices = addresses.index_select(0, rows).reshape(-1, 1)
 
     def execute(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: Attention) -> torch.Tensor:
         metadata = self._metadata
@@ -56,10 +65,17 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
         query = q.view(-1, self.num_heads, self.head_dim).contiguous()
         key = k.view(-1, self.num_kv_heads, self.head_dim)
         value = v.view_as(key)
-        slots = self._full_slot_mapping(metadata)
+        key_pages = cache.key.transpose(1, 2)
+        value_pages = cache.value.transpose(1, 2)
         key_int8, key_scale = dynamic_quant(key.contiguous())
         value_int8, value_scale = dynamic_quant(value.contiguous())
-        reshape_paged_cache(slots, key_int8, value_int8, cache.key, cache.value)
+        reshape_paged_cache(
+            self._write_slots,
+            key_int8.view(-1, 1, self.head_dim),
+            value_int8.view(-1, 1, self.head_dim),
+            key_pages.view(-1, self.page_size, 1, self.head_dim),
+            value_pages.view(-1, self.page_size, 1, self.head_dim),
+        )
         if self._scale_indices.numel():
             if self._scale_rows is not None:
                 key_scale = key_scale.index_select(0, self._scale_rows)
@@ -86,8 +102,8 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
         else:
             output, _ = self._fused_attention(
                 query.unsqueeze(2),
-                cache.key.flatten(2),
-                cache.value.flatten(2),
+                key_pages,
+                value_pages,
                 input_layout="BNSD",
                 num_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
