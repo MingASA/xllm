@@ -147,6 +147,8 @@ For autoregressive models with ordinary causal GQA, use these options in the lau
 
 Use `--enable_graph=false` for eager execution or `--enable_graph=true --python_graph_backend=aclgraph` for captured decode. Keep `--block_size=128` for the initial comparison and set `--kv_cache_dtype=auto` for the model-precision baseline. K and V each have one FP32 scale per token and KV head. On hybrid models, convolution and recurrent states retain their configured precision and share the cache budget with the GQA pages.
 
+For ACL Graph, set `--acl_graph_decode_batch_size_limit` to cover the expected active decode batch per rank. For example, with `--max_seqs_per_batch=64`, use `--acl_graph_decode_batch_size_limit=64` when memory allows. The default covers 16 sequences. An INT8 page pool can admit more long requests at the same cache budget, and batches above the graph limit fall back to eager execution.
+
 ## Verify the service
 
 In another shell, wait for model loading to finish and query the rank-0 service (port `8010` in this example):

@@ -147,6 +147,8 @@ NNODES=2
 
 使用 `--enable_graph=false` 运行 Eager，或使用 `--enable_graph=true --python_graph_backend=aclgraph` 捕获 decode。初次对照可沿用 `--block_size=128`，将 `--kv_cache_dtype` 改成 `auto` 即可测量模型原始精度。K 和 V 分别为每个 token 的每个 KV head 保存一个 FP32 尺度。混合模型的卷积和递归状态沿用配置中的精度，并与 GQA 页共享缓存预算。
 
+使用 ACL Graph 时，将 `--acl_graph_decode_batch_size_limit` 设到能够覆盖每个 rank 预期的解码并发。例如，使用 `--max_seqs_per_batch=64` 且显存充足时，可以设置 `--acl_graph_decode_batch_size_limit=64`。默认上限为 16。相同缓存预算下，INT8 可以同时容纳更多长请求，超过图上限的批次会回退到 Eager。
+
 ## 验证服务
 
 在另一个 shell 中，等待模型加载完成后查询 rank 0 的服务（本例端口为 `8010`）：
