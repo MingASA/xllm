@@ -226,7 +226,7 @@ except RuntimeError as error:
 else:
     raise AssertionError('uninitialized runtime accepted')
 try:
-    xllm_kernel.initialize(device='cuda')
+    xllm_kernel.initialize(device='cuda', operations=('rms_norm',))
 except ValueError as error:
     assert 'adapter' in str(error)
 else:
@@ -301,8 +301,20 @@ def test_initialize_selects_highest_priority_and_reuses_frozen_binding(
         "torch_npu",
         SimpleNamespace(npu_rms_norm=lambda *args, **kwargs: (42, 0), npu_add_rms_norm=lambda *args: None),
     )
+    from xllm_kernel import runtime
+    from xllm_kernel.ops.kv_cache import CONVERT_XQA_PAGES_OPERATION, WRITE_FP8_KV_OPERATION
+    from xllm_kernel.ops.normalization import RMS_NORM_OPERATION
+    from xllm_kernel.ops.quantization import QUANTIZE_QUERY_FP8_OPERATION
+
+    catalog = (RMS_NORM_OPERATION, WRITE_FP8_KV_OPERATION, QUANTIZE_QUERY_FP8_OPERATION, CONVERT_XQA_PAGES_OPERATION)
+    monkeypatch.setattr(runtime, "load_operations", lambda: catalog)
     _backend_registry.register(replace(_spec("npu.other"), priority=99), _identity)
-    plan = initialize(device="npu", operations=("rms_norm",))["rms_norm"]
+    bindings = initialize(device="npu")
+    assert tuple(bindings) == ("rms_norm",)
+    for op in catalog[1:]:
+        with pytest.raises(ValueError, match="adapters for 'npu'"):
+            initialize(device="npu", operations=(op.contract.operation,))
+    plan = bindings["rms_norm"]
     assert plan.spec.name == "npu.other"
     assert initialize(device="npu", operations=("rms_norm",))["rms_norm"] is plan
     with pytest.raises(RuntimeError, match="frozen"):

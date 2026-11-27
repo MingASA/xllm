@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "core/common/prefill_policy.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/speculative_config.h"
@@ -64,6 +65,8 @@ void Options::validate(std::string_view model_type) const {
     CHECK(ModelConfig::is_python_model_impl(
         ModelConfig::get_instance().model_impl()))
         << "Native FP8 KV requires the CUDA Python Executor.";
+    CHECK(!KVCacheConfig::get_instance().enable_vmm_kvcache())
+        << "Native FP8 KV requires resident pages; VMM is not supported.";
     CHECK(!has_draft_model && num_speculative_tokens() == 0)
         << "Native FP8 KV requires ordinary autoregressive decoding.";
     CHECK(cp_size() == 1 &&

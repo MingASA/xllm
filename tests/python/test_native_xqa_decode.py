@@ -35,8 +35,7 @@ def _cpu_plan() -> xqa_decode.XQADecodePlan:
 
 def _metadata() -> SimpleNamespace:
     return SimpleNamespace(
-        paged_kv_indptr_host=torch.tensor([0, 1, 2], dtype=torch.int32),
-        paged_kv_last_page_len_host=torch.tensor([1, 1], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([1, 1], dtype=torch.int32),
         paged_kv_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
         paged_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
         paged_kv_last_page_len=torch.tensor([1, 1], dtype=torch.int32),
@@ -63,7 +62,7 @@ def test_csr_requires_flat_contiguous_buffers(field: str, layout: str) -> None:
 
 @pytest.mark.parametrize(
     "batch,page,maximum",
-    [(0, 128, 256), (-1, 128, 256), (2, 0, 256), (2, 8, 256), (2, 256, 512), (2, 128, 0), (2, 128, 129)],
+    [(0, 128, 256), (-1, 128, 256), (2, 0, 256), (2, 8, 256), (2, 256, 512), (2, 128, 0), (2, 128, -1)],
 )
 def test_invalid_geometry_fails_before_device_query_or_allocation(batch: int, page: int, maximum: int) -> None:
     with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)) as capability:
@@ -76,13 +75,11 @@ def test_invalid_geometry_fails_before_device_query_or_allocation(batch: int, pa
 
 
 @pytest.mark.parametrize(
-    "indptr,last",
-    [([0, 1, 2], [0, 1]), ([0, 1, 2], [129, 1]), ([0, 1, 1], [1, 2]), ([0, 2, 1], [1, 1]), ([0, 1, 4], [1, 1])],
+    "lengths", [torch.tensor([1], dtype=torch.int32), torch.tensor([1, 2]), torch.tensor([1, 257], dtype=torch.int32)]
 )
-def test_invalid_host_pages_fail_before_launch(indptr: list[int], last: list[int]) -> None:
+def test_invalid_host_lengths_fail_before_launch(lengths: torch.Tensor) -> None:
     metadata = _metadata()
-    metadata.paged_kv_indptr_host = torch.tensor(indptr, dtype=torch.int32)
-    metadata.paged_kv_last_page_len_host = torch.tensor(last, dtype=torch.int32)
+    metadata.kv_seq_lens_host = lengths
     with patch.object(xqa_decode, "convert_xqa_pages", MagicMock()) as kernel:
         with pytest.raises(ValueError):
             _cpu_plan().prepare(metadata, graph_mode=False)
@@ -91,8 +88,9 @@ def test_invalid_host_pages_fail_before_launch(indptr: list[int], last: list[int
 
 def test_graph_padding_is_accepted_but_changed_addresses_are_rejected() -> None:
     metadata = _metadata()
-    metadata.paged_kv_indptr_host.copy_(torch.tensor([0, 1, 1], dtype=torch.int32))
-    metadata.paged_kv_indptr.copy_(metadata.paged_kv_indptr_host)
+    metadata.kv_seq_lens_host[:] = torch.tensor([256, 0], dtype=torch.int32)
+    metadata.paged_kv_indptr[1:] = 2
+    metadata.paged_kv_last_page_len[0] = 128
     plan = _cpu_plan()
     with patch.object(xqa_decode, "convert_xqa_pages", MagicMock()) as kernel:
         plan.prepare(metadata, graph_mode=True)

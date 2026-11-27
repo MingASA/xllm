@@ -34,22 +34,26 @@ _SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 
 
 
 @pytest.mark.skipif(not _SM90, reason="requires SM90")
-def test_default_cuda_worker_does_not_load_native_fp8_ops() -> None:
-    # conftest has already bound the FP8 test worker. Exercise default startup
-    # in a fresh process with the same native extension as the parent.
+def test_cuda_startup_without_triton() -> None:
+    pytest.importorskip("flashinfer")
+    # Start a fresh registry with Triton unavailable to discovery and import.
     script = """
 import sys
+sys.modules["triton"] = None
 import pytest
+import torch
 from xllm import xllm_export
 from xllm.python import initialize_runtime
 
 initialize_runtime()
-from xllm_kernel.ops.kv_cache import WRITE_FP8_KV_OPERATION
-assert WRITE_FP8_KV_OPERATION.prepared is None
+from xllm_kernel.ops.positional_encoding import PARTIAL_ROTARY_EMBEDDING_OPERATION
+from xllm.python.attention.flashinfer_native_kv import FlashInferNativeKVBackend
+
+assert PARTIAL_ROTARY_EMBEDDING_OPERATION.prepared is not None
 assert "xllm_kernel.ops.kv_cache.native_kv_writer" not in sys.modules
 assert "xllm_kernel.ops.quantization.query_quantization" not in sys.modules
-with pytest.raises(RuntimeError, match="restart the worker"):
-    initialize_runtime(kv_cache_dtype="fp8_e4m3")
+with pytest.raises(RuntimeError, match="Native FP8 KV.*prepared at startup with Triton"):
+    FlashInferNativeKVBackend(8, 1, 128, 0.125, 0, torch.device("cuda"), torch.bfloat16, "fp8_e4m3")
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 
@@ -122,15 +126,15 @@ def test_fp8_binding_preserves_storage_and_whole_page_copy(
     owner_v = torch.zeros_like(owner_k)
     caches = [LayerCache(None, None), LayerCache(owner_k, owner_v)]
     storage_backend.bind_kv_caches(caches)
-    key, value = storage_backend._pages[1]
+    key, value = storage_backend._kv_caches[1].key, storage_backend._kv_caches[1].value
+    assert key is not None and value is not None
     assert key.dtype == value.dtype == torch.float8_e4m3fn
     assert key.data_ptr() == owner_k.data_ptr()
     assert value.data_ptr() == owner_v.data_ptr()
     assert storage_backend._kv_caches is caches
-    assert 0 not in storage_backend._pages
     info = storage_backend.native_kv_runtime_info()
     actual_storage = owner_k.untyped_storage().nbytes() + owner_v.untyped_storage().nbytes()
-    assert info["resident_KV_bytes"] == info["KV_tensor_address_bytes"] == actual_storage
+    assert info["resident_KV_bytes"] == actual_storage
     owner_k[0].view(torch.uint8).fill_(17)
     owner_v[0].view(torch.uint8).fill_(29)
     owner_k[2].copy_(owner_k[0])
@@ -185,14 +189,13 @@ def test_backend_rejects_other_formats(backend_type: type[FlashInferNativeKVBack
 
 
 @pytest.mark.parametrize(
-    ("capability", "heads", "kv_heads", "dim", "window", "vmm", "error"),
+    ("capability", "heads", "kv_heads", "dim", "window", "error"),
     [
-        ((8, 6), 24, 4, 256, 0, False, "SM90"),
-        ((9, 0), 24, 4, 64, 0, False, "head_dim"),
-        ((9, 0), 8, 4, 256, 0, False, "GQA"),
-        ((9, 0), 17, 4, 256, 0, False, "GQA"),
-        ((9, 0), 24, 4, 256, 0, True, "VMM"),
-        ((9, 0), 24, 4, 256, 128, False, "full attention"),
+        ((8, 6), 24, 4, 256, 0, "SM90"),
+        ((9, 0), 24, 4, 64, 0, "head_dim"),
+        ((9, 0), 8, 4, 256, 0, "GQA"),
+        ((9, 0), 17, 4, 256, 0, "GQA"),
+        ((9, 0), 24, 4, 256, 128, "full attention"),
     ],
 )
 def test_rejects_unsupported_attention_before_allocation(
@@ -203,7 +206,6 @@ def test_rejects_unsupported_attention_before_allocation(
     kv_heads: int,
     dim: int,
     window: int,
-    vmm: bool,
     error: str,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
@@ -217,7 +219,6 @@ def test_rejects_unsupported_attention_before_allocation(
             torch.device("cuda"),
             torch.bfloat16,
             "fp8_e4m3",
-            virtual_memory=vmm,
         )
 
 
@@ -295,7 +296,7 @@ def test_native_attention_matches_dense_reference(
         dtype,
         "fp8_e4m3",
         fixed_scales=load_kv_cache_scales(tmp_path),
-        max_context_tokens=32,
+        max_context_tokens=17,
     )
     rng = torch.Generator(device=device).manual_seed(73)
 
@@ -328,8 +329,7 @@ def test_native_attention_matches_dense_reference(
         is_chunked_prefill=mixed,
         qo_indptr=None if prefill else qo_indptr,
         q_cu_seq_lens=qo_indptr,
-        paged_kv_indptr_host=indptr,
-        paged_kv_last_page_len_host=tails,
+        kv_seq_lens_host=torch.tensor([17, 3], dtype=torch.int32),
         paged_kv_indptr=indptr.cuda(),
         paged_kv_last_page_len=tails.cuda(),
         paged_kv_indices=torch.tensor([2, 1, 3], device=device, dtype=torch.int32),
@@ -340,14 +340,20 @@ def test_native_attention_matches_dense_reference(
     layer = SimpleNamespace(layer_id=0)
     if phase == "decode":
         # A failed plan must leave the original pages intact even if execute is called.
-        metadata.paged_kv_indptr_host = None
-        with pytest.raises(ValueError, match="CPU planner metadata"):
+        backend.prepare(metadata)
+        metadata.kv_seq_lens_host[0] = 18  # Fits the padded table, exceeds the declared context.
+        with pytest.raises(ValueError, match="exceeds the declared model context"):
+            backend.prepare(metadata)
+        with pytest.raises(RuntimeError, match="before writing KV"):
+            backend.execute(q, k, v, layer)
+        metadata.kv_seq_lens_host = None
+        with pytest.raises(ValueError, match="host KV length"):
             backend.prepare(metadata)
         with pytest.raises(RuntimeError, match="before writing KV"):
             backend.execute(q, k, v, layer)
         for owner in caches:
             assert not owner.view(torch.uint8).view(-1, 1, dim)[cache_slots[new_indices]].any()
-        metadata.paged_kv_indptr_host = indptr
+        metadata.kv_seq_lens_host = torch.tensor([17, 3], dtype=torch.int32)
     backend.prepare(metadata, graph_mode=graph_mode)
     if phase in ("decode", "decode_graph"):
         plan = backend._active_xqa_plan

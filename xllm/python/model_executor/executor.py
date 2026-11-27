@@ -264,7 +264,6 @@ def _create_attention_backend(
                 cache_dtype=cache_dtype,
                 fixed_scales=load_kv_cache_scales(config["model_path"]),
                 max_context_tokens=int(config.get("max_position_embeddings", 32768)),
-                virtual_memory=bool(config.get("enable_vmm_kvcache", False)),
             )
         from xllm.python.attention.flashinfer import FlashInferBackend
 

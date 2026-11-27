@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "core/common/prefill_policy.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/platform/platform.h"
@@ -44,6 +45,12 @@ TEST(OptionsTest, ValidatesNativeFP8BeforeEngineCreation) {
         options.validate(kModelType);
       },
       "CUDA Python Executor");
+  EXPECT_DEATH(
+      {
+        KVCacheConfig::get_instance().enable_vmm_kvcache(true);
+        options.validate(kModelType);
+      },
+      "VMM");
   EXPECT_DEATH(options.draft_model_path("draft").validate(kModelType),
                "ordinary autoregressive decoding");
   EXPECT_DEATH(options.speculative_algorithm("Suffix")

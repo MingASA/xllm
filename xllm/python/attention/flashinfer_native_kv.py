@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING
 
 import flashinfer
 import torch
-from xllm_kernel.ops.kv_cache import write_fp8_kv
-from xllm_kernel.ops.quantization import quantize_query_fp8
+from xllm_kernel.ops.kv_cache import CONVERT_XQA_PAGES_OPERATION, WRITE_FP8_KV_OPERATION, write_fp8_kv
+from xllm_kernel.ops.quantization import QUANTIZE_QUERY_FP8_OPERATION, quantize_query_fp8
 
 from scripts.logger import logger
 from xllm.python.attention.backend import AttentionMetadata, LayerCache
@@ -46,7 +46,6 @@ class FlashInferNativeKVBackend(FlashInferBackend):
         cache_dtype: str,
         fixed_scales: tuple[float, float] = (1.0, 1.0),
         max_context_tokens: int = 32768,
-        virtual_memory: bool = False,
     ) -> None:
         if cache_dtype != "fp8_e4m3":
             raise ValueError("Native FP8 KV requires fp8_e4m3")
@@ -56,18 +55,18 @@ class FlashInferNativeKVBackend(FlashInferBackend):
             raise ValueError("Native SM90 KV requires BF16/FP16 activations and head_dim 128/256")
         if num_kv_heads <= 0 or num_heads % num_kv_heads or num_heads // num_kv_heads < 4:
             raise ValueError("Native KV currently requires a tensor-core decode GQA group of at least 4")
-        if virtual_memory:
-            raise ValueError("Native FP8 KV requires initialized resident pages; VMM is not qualified")
         if sliding_window > 0:
-            raise ValueError(
-                "This XQA integration requires non-VMM full attention with zero-initialized resident pages"
-            )
+            raise ValueError("Native FP8 XQA requires full attention without a sliding window")
+        for op in (WRITE_FP8_KV_OPERATION, QUANTIZE_QUERY_FP8_OPERATION, CONVERT_XQA_PAGES_OPERATION):
+            if op.prepared is None:
+                raise RuntimeError(
+                    f"Native FP8 KV requires {op.contract.operation} to be prepared at startup with Triton"
+                )
         self._max_context_tokens = max_context_tokens
         self._graph_xqa_plans: dict[int, XQADecodePlan] = {}
         self._eager_xqa_plan: XQADecodePlan | None = None
         self._active_xqa_plan: XQADecodePlan | None = None
         self._fixed_scales = fixed_scales
-        self._pages: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         super().__init__(num_heads, num_kv_heads, head_dim, scale, sliding_window, device, dtype)
         # FlashInfer requires a zeroed workspace on first use. In
         # particular, its first 8MiB hold atomic CTA completion counters.
@@ -84,8 +83,7 @@ class FlashInferNativeKVBackend(FlashInferBackend):
 
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         geometry: tuple[int, int] | None = None
-        pages: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer_id, cache in enumerate(kv_caches):
+        for cache in kv_caches:
             if cache.key is None:
                 if cache.value is not None:
                     raise ValueError("Full-attention K/V must be paired")
@@ -114,15 +112,14 @@ class FlashInferNativeKVBackend(FlashInferBackend):
                 raise ValueError(
                     f"Native FP8 KV layers must use the same page geometry: {geometry} vs {layer_geometry}"
                 )
-            pages[layer_id] = (cache.key, cache.value)
-        if not pages:
+        if geometry is None:
             raise ValueError("Native KV requires full-attention resident pages")
         self._kv_caches = kv_caches
-        self._pages = pages
         logger.info("Native KV backend bound: %s", json.dumps(self.native_kv_runtime_info(), sort_keys=True))
 
     def prepare(self, metadata: AttentionMetadata, *, graph_mode: bool = False) -> None:
         self._metadata = metadata
+        self._active_xqa_plan = None
         if metadata.is_prefill or metadata.is_chunked_prefill:
             query_indptr = metadata.qo_indptr if metadata.qo_indptr is not None else metadata.q_cu_seq_lens
             self._prefill_paged_wrapper.plan(
@@ -146,9 +143,7 @@ class FlashInferNativeKVBackend(FlashInferBackend):
         batch_size = metadata.paged_kv_last_page_len.numel()
         plan = self._graph_xqa_plans.get(batch_size) if graph_mode else self._eager_xqa_plan
         if plan is None or plan.batch_size != batch_size:
-            page_size = self.page_size
-            maximum = ((self._max_context_tokens + page_size - 1) // page_size) * page_size
-            plan = XQADecodePlan(batch_size, page_size, maximum, self._decode_workspace.device)
+            plan = XQADecodePlan(batch_size, self.page_size, self._max_context_tokens, self._decode_workspace.device)
             if graph_mode:
                 self._graph_xqa_plans[batch_size] = plan
             else:
@@ -166,7 +161,10 @@ class FlashInferNativeKVBackend(FlashInferBackend):
             raise RuntimeError("XQA decode plan must be prepared before writing KV")
         key = k.view(-1, self.num_kv_heads, self.head_dim)
         value = v.view(-1, self.num_kv_heads, self.head_dim)
-        pages = self._pages[layer.layer_id]
+        cache = self._kv_caches[layer.layer_id]
+        if cache.key is None or cache.value is None:
+            raise RuntimeError(f"full-attention KV cache is missing for layer {layer.layer_id}")
+        pages = (cache.key, cache.value)
         write_fp8_kv(key, value, metadata.slot_mapping, *pages, *self._fixed_scales)
         query = q.view(-1, self.num_heads, self.head_dim)
         if decode_plan is not None:
@@ -179,24 +177,18 @@ class FlashInferNativeKVBackend(FlashInferBackend):
         return output.view(-1, self.num_heads * self.head_dim)
 
     def native_kv_runtime_info(self) -> dict[str, object]:
-        resident_bytes = sum(key.nbytes + value.nbytes for key, value in self._pages.values())
+        resident_bytes = sum(
+            tensor.nbytes for cache in self._kv_caches for tensor in (cache.key, cache.value) if tensor is not None
+        )
         return {
             "kv_cache_dtype": "fp8_e4m3",
             "resident_layout": "NHD",
             "k_scale": self._fixed_scales[0],
             "v_scale": self._fixed_scales[1],
-            "writer": "fused_triton_quantize_scatter",
             "prefill_backend": "fa3",
             "decode_backend": "xqa",
             "prefill_query_dtype": str(torch.float8_e4m3fn),
             "decode_query_dtype": str(self.dtype),
             "max_context_tokens": self._max_context_tokens,
-            "xqa_workspace_initialized": True,
-            "query_dtype": str(self.dtype),
-            "mixed_FP8_decode": None,
-            "full_BF16_KV_shadow": False,
-            "KV_tensor_address_bytes": resident_bytes,
-            "VMM_virtual_address_capacity_not_residency": False,
             "resident_KV_bytes": resident_bytes,
-            "resident_global_scale_bytes": 0,
         }

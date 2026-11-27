@@ -45,23 +45,18 @@ def _load_kernel_package() -> ModuleType:
     return importlib.import_module("xllm_kernel")
 
 
-def initialize_runtime(kv_cache_dtype: str = "auto") -> None:
+def initialize_runtime() -> None:
     """Initialize and publish the active platform's Python kernel package."""
 
     global _runtime_kernels
     if _runtime_kernels is not None:
-        if kv_cache_dtype == "fp8_e4m3":
-            from xllm_kernel.ops.kv_cache import WRITE_FP8_KV_OPERATION
-
-            if WRITE_FP8_KV_OPERATION.prepared is None:
-                raise RuntimeError("Native FP8 operations must be prepared at startup; restart the worker")
         return
 
     from xllm.python.platform import current_platform
 
     if current_platform.is_cuda():
         operations = ("partial_rotary_embedding",)
-        if kv_cache_dtype == "fp8_e4m3":
+        if find_spec("triton") is not None:
             operations += ("write_fp8_kv", "quantize_query_fp8", "convert_xqa_pages")
         _load_kernel_package().initialize(device="cuda", operations=operations)
         backend_name = "xllm.python.kernels_cuda"

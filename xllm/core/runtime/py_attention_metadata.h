@@ -58,8 +58,7 @@ class PyAttentionMetadataView final {
  public:
   PyAttentionMetadataView(std::shared_ptr<layer::AttentionMetadata> metadata,
                           const ModelParamsView& params,
-                          bool is_draft_engine,
-                          int32_t block_size);
+                          bool is_draft_engine);
 
   const torch::Tensor& slot_mapping() const;
   pybind11::object local_slot_mapping() const;
@@ -67,8 +66,6 @@ class PyAttentionMetadataView final {
   int32_t kv_split_rank() const;
   bool has_kv_shard() const;
   const torch::Tensor& paged_kv_indptr() const;
-  pybind11::object paged_kv_indptr_host() const;
-  pybind11::object paged_kv_last_page_len_host() const;
   const torch::Tensor& paged_kv_indices() const;
   const torch::Tensor& paged_kv_last_page_len() const;
   pybind11::object qo_indptr() const;
@@ -130,7 +127,6 @@ class PyAttentionMetadataView final {
       std::vector<int32_t>& host_vec);
 
   std::shared_ptr<layer::AttentionMetadata> metadata_;
-  int32_t block_size_;
   bool is_target_verify_ = false;
   torch::Tensor kv_seq_lens_host_;
   torch::Tensor q_seq_lens_host_;
