@@ -1715,3 +1715,39 @@ def test_int8_decode_graph_refreshes_pages_and_scales(monkeypatch: pytest.Monkey
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     for name in ("key", "value", "key_scale", "value_scale"):
         torch.testing.assert_close(getattr(graph_cache, name), getattr(eager_cache, name), rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_int8_graph_writer_preserves_eager_rounding() -> None:
+    from xllm_kernel.ops.kv_cache import write_int8_kv
+
+    from xllm.python.platform import current_platform
+
+    if current_platform.get_ascend_soc_generation() != "a3":
+        pytest.skip("requires Ascend 910C INT8 cache writes")
+
+    device = torch.device("npu:0")
+    key, value = [torch.zeros(32, 2, 256, dtype=torch.bfloat16, device=device) for _ in range(2)]
+    slots = torch.arange(32, device=device, dtype=torch.int32)
+    pages = [torch.empty((2, 2, 128, 256), dtype=torch.int8, device=device) for _ in range(2)]
+    pages += [torch.empty((2, 2, 128), dtype=torch.float32, device=device) for _ in range(2)]
+    reference = [torch.empty_like(page) for page in pages]
+    write_int8_kv(key, value, slots, *reference)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        write_int8_kv(key, value, slots, *pages)
+
+    # These BF16 peaks distinguish an IEEE division from multiplication by a rounded reciprocal.
+    peaks = torch.tensor([143, 144, 175, 207, 208, 239, 254, 0], dtype=torch.float32).repeat(4) / 128
+    data = (torch.linspace(-1, 1, 256) * peaks[:, None]).bfloat16().to(device)
+    for step in (0, 1):
+        key.copy_(data.roll(step, 0)[:, None, :])
+        value.copy_(-key.roll(1, 0))
+        slots.copy_((torch.arange(32, dtype=torch.int32) * 7 + 41 * step) % 256)
+        slots[-2:] = -1
+        for page in (*reference, *pages):
+            page.fill_(-117)
+        write_int8_kv(key, value, slots, *reference)
+        graph.replay()
+        for actual, expected in zip(pages, reference):
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)

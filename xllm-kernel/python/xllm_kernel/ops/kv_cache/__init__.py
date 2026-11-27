@@ -36,6 +36,12 @@ WRITE_INT8_KV_OPERATION = Operation(
             requires=("torch_npu", "triton"),
             implementations=("npu.triton.write_int8_kv",),
         ),
+        BackendModule(
+            module="xllm_kernel.ops.kv_cache.int8_tilelang",
+            platform=PlatformEnum.NPU,
+            requires=("tilelang", "torch_npu", "triton"),
+            implementations=("npu.tilelang.write_int8_kv",),
+        ),
     ),
 )
 SHARED_FULL_INDICES_OUT_CONTRACT = OpContract(
