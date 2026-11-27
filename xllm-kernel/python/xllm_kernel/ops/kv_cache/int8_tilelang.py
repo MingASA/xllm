@@ -18,11 +18,13 @@ if TYPE_CHECKING:
 
 
 @cache
-def _prepare_writer(tokens: int, blocks: int, page: int) -> "JITKernel":
+def _prepare_writer(page: int) -> "JITKernel":
     from xllm_kernel.ops._tilelang import VECTOR_CORES
 
     heads, dim = 2, 256
-    groups = min(VECTOR_CORES, tokens) // 2
+    tokens = T.symbolic("tokens")
+    blocks = T.symbolic("blocks")
+    groups = T.min(VECTOR_CORES // 2, T.ceildiv(tokens, 2))
 
     @T.prim_func
     def write(
@@ -47,8 +49,8 @@ def _prepare_writer(tokens: int, blocks: int, page: int) -> "JITKernel":
             quantized = T.alloc_shared((heads, dim), "int8")
             # MTE3 requires 32-byte alignment even for a single FP32 scale.
             dma_scale = T.alloc_shared((8,), "float32")
-            for group in T.serial(T.ceildiv(tokens, groups * 2)):
-                token = group * groups * 2 + core * 2 + vector
+            for group in T.serial(T.ceildiv(tokens, VECTOR_CORES)):
+                token = group * VECTOR_CORES + core * 2 + vector
                 if token < tokens:
                     slot = slots[token]
                     if slot >= 0 and slot < blocks * page:
@@ -90,7 +92,7 @@ if current_platform.get_ascend_soc_generation() == "a3":
         name="npu.tilelang.write_int8_kv",
         platform=PlatformEnum.NPU,
         execution_modes=("aclgraph",),
-        input_domain="A3 GQA with contiguous BF16 B32/B64 H2 D256 graph tiles and general strided Triton writes.",
+        input_domain="A3 GQA with contiguous BF16 B32/B48/B64 H2 D256 graph tiles and general strided Triton writes.",
         solution="tilelang",
         binding="python",
         priority=1,
@@ -107,7 +109,7 @@ if current_platform.get_ascend_soc_generation() == "a3":
     ) -> None:
         args = (key, value, slots, key_pages, value_pages, key_scales, value_scales)
         if (
-            key.shape in ((32, 2, 256), (64, 2, 256))
+            key.shape in ((32, 2, 256), (48, 2, 256), (64, 2, 256))
             and key.dtype == value.dtype == torch.bfloat16
             and slots.dtype == torch.int32
             and key.is_contiguous()
@@ -116,6 +118,6 @@ if current_platform.get_ascend_soc_generation() == "a3":
             and key_pages.numel() <= 2**31 - 1
             and torch.npu.is_current_stream_capturing()
         ):
-            _prepare_writer(key.size(0), key_pages.size(0), key_pages.size(2))(*args, 127.0)
+            _prepare_writer(key_pages.size(2))(*args, 127.0)
         else:
             _triton_write(*args)
