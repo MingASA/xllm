@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2026 The xLLM Authors.
 # Adapted from vLLM contributors' _reshape_cache_per_token_head in
 # vllm/v1/attention/ops/triton_reshape_and_cache_flash.py.
@@ -40,25 +41,28 @@ def _write_int8_head(
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
+    component = tl.program_id(2)
     slot = tl.load(slots + token * slot_stride).to(tl.int64)
     if slot >= 0 and slot < capacity:
         lane = tl.arange(0, channels)
-        k = tl.load(key + token * key_stride_t + head * key_stride_h + lane * key_stride_d, lane < dim, 0).to(
-            tl.float32
-        )
-        v = tl.load(value + token * value_stride_t + head * value_stride_h + lane * value_stride_d, lane < dim, 0).to(
-            tl.float32
-        )
-        k_scale = tl.max(tl.abs(k), 0) / 127.0
-        v_scale = tl.max(tl.abs(v), 0) / 127.0
-        k_int8 = libdevice.rint(k / tl.where(k_scale > 0, k_scale, 1.0)).to(tl.int8)
-        v_int8 = libdevice.rint(v / tl.where(v_scale > 0, v_scale, 1.0)).to(tl.int8)
-        # One scalar address per program keeps Ascend loads and stores contiguous.
         row = slot + ((slot // page_size) * (heads - 1) + head) * page_size
-        tl.store(key_pages + row * dim + lane, k_int8, lane < dim)
-        tl.store(value_pages + row * dim + lane, v_int8, lane < dim)
-        tl.store(key_scales + row, k_scale)
-        tl.store(value_scales + row, v_scale)
+        # Independent K/V programs expose more parallel work at decode batch sizes.
+        if component == 0:
+            data = tl.load(key + token * key_stride_t + head * key_stride_h + lane * key_stride_d, lane < dim, 0).to(
+                tl.float32
+            )
+        else:
+            data = tl.load(
+                value + token * value_stride_t + head * value_stride_h + lane * value_stride_d, lane < dim, 0
+            ).to(tl.float32)
+        scale = tl.max(tl.abs(data), 0) / 127.0
+        quantized = libdevice.rint(data / tl.where(scale > 0, scale, 1.0)).to(tl.int8)
+        if component == 0:
+            tl.store(key_pages + row * dim + lane, quantized, lane < dim)
+            tl.store(key_scales + row, scale)
+        else:
+            tl.store(value_pages + row * dim + lane, quantized, lane < dim)
+            tl.store(value_scales + row, scale)
 
 
 @register_kernel(
@@ -81,7 +85,7 @@ def _write_int8_kv(
 ) -> None:
     tokens, heads, dim = key.shape
     if tokens:
-        _write_int8_head[(tokens, heads)](
+        _write_int8_head[(tokens, heads, 2)](
             key,
             value,
             slots,
