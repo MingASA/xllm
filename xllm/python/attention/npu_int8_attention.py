@@ -6,15 +6,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch_npu
-from xllm_kernel.ops.kv_cache import reshape_paged_cache
-from xllm_kernel.ops.quantization import dynamic_quant
+from xllm_kernel.ops.kv_cache import write_int8_kv
 
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.npu_paged_attention import SPARSE_MODE_RIGHT_DOWN_CAUSAL, NpuPagedAttentionBackend
 
 if TYPE_CHECKING:
-    from xllm.python.attention.backend import AttentionMetadata
     from xllm.python.layers.attention import Attention
 
 
@@ -37,26 +34,10 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
                 raise ValueError("INT8 GQA requires head-major signed INT8 K/V pages")
             scale_shape = (self.num_kv_blocks, self.num_kv_heads, self.page_size)
             if any(
-                scale is None or scale.dtype != torch.float32 or scale.shape != scale_shape
+                scale is None or scale.dtype != torch.float32 or scale.shape != scale_shape or not scale.is_contiguous()
                 for scale in (cache.key_scale, cache.value_scale)
             ):
-                raise ValueError("INT8 GQA requires FP32 scale pages shaped [block, head, token]")
-
-    def prepare(self, metadata: AttentionMetadata, *, graph_mode: bool = False) -> None:
-        super().prepare(metadata, graph_mode=graph_mode)
-        slots = self._full_slot_mapping(metadata)
-        rows = torch.where(slots >= 0)[0]
-        self._scale_rows = None if rows.numel() == slots.numel() else rows
-        # Each head occupies one contiguous physical page for both values and scales.
-        head_offsets = torch.arange(self.num_kv_heads, dtype=slots.dtype, device=slots.device) * self.page_size
-        first_head = slots + (slots // self.page_size) * ((self.num_kv_heads - 1) * self.page_size)
-        addresses = first_head[:, None] + head_offsets
-        if self._scale_rows is None:
-            self._write_slots = addresses.flatten()
-            self._scale_indices = self._write_slots.view(-1, 1)
-        else:
-            self._write_slots = torch.where(slots[:, None] >= 0, addresses, -1).flatten()
-            self._scale_indices = addresses.index_select(0, rows).reshape(-1, 1)
+                raise ValueError("INT8 GQA requires contiguous FP32 scale pages shaped [block, head, token]")
 
     def execute(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: Attention) -> torch.Tensor:
         metadata = self._metadata
@@ -67,21 +48,9 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
         value = v.view_as(key)
         key_pages = cache.key.transpose(1, 2)
         value_pages = cache.value.transpose(1, 2)
-        key_int8, key_scale = dynamic_quant(key.contiguous())
-        value_int8, value_scale = dynamic_quant(value.contiguous())
-        reshape_paged_cache(
-            self._write_slots,
-            key_int8.view(-1, 1, self.head_dim),
-            value_int8.view(-1, 1, self.head_dim),
-            key_pages.view(-1, self.page_size, 1, self.head_dim),
-            value_pages.view(-1, self.page_size, 1, self.head_dim),
+        write_int8_kv(
+            key, value, self._full_slot_mapping(metadata), key_pages, value_pages, cache.key_scale, cache.value_scale
         )
-        if self._scale_indices.numel():
-            if self._scale_rows is not None:
-                key_scale = key_scale.index_select(0, self._scale_rows)
-                value_scale = value_scale.index_select(0, self._scale_rows)
-            torch_npu.npu_scatter_nd_update_(cache.key_scale.view(-1), self._scale_indices, key_scale.flatten())
-            torch_npu.npu_scatter_nd_update_(cache.value_scale.view(-1), self._scale_indices, value_scale.flatten())
 
         if metadata.is_prefill:
             # The whole prompt is present in model precision before the first decode.

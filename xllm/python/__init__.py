@@ -142,6 +142,11 @@ def initialize_runtime() -> None:
                 "mrope",
                 "vision_rotary_mul",
                 "reshape_paged_cache",
+                *(
+                    ("write_int8_kv",)
+                    if find_spec("triton") is not None and current_platform.get_ascend_soc_generation() == "a3"
+                    else ()
+                ),
                 "update_decode_graph_metadata",
                 *(
                     (

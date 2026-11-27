@@ -24,6 +24,20 @@ RESHAPE_PAGED_CACHE_OPERATION = Operation(
         ),
     ),
 )
+WRITE_INT8_KV_CONTRACT = OpContract(
+    "write_int8_kv", 1, ("key_pages", "value_pages", "key_scales", "value_scales"), False, "dynamic_int8_head_scatter"
+)
+WRITE_INT8_KV_OPERATION = Operation(
+    WRITE_INT8_KV_CONTRACT,
+    (
+        BackendModule(
+            module="xllm_kernel.ops.kv_cache.int8_npu",
+            platform=PlatformEnum.NPU,
+            requires=("torch_npu", "triton"),
+            implementations=("npu.triton.write_int8_kv",),
+        ),
+    ),
+)
 SHARED_FULL_INDICES_OUT_CONTRACT = OpContract(
     "shared_full_indices_out", 1, ("out_tables", "out_slots"), False, "paged_indices"
 )
@@ -91,11 +105,25 @@ CONVERT_XQA_PAGES_OPERATION = Operation(
 )
 OPERATIONS = (
     RESHAPE_PAGED_CACHE_OPERATION,
+    WRITE_INT8_KV_OPERATION,
     SHARED_FULL_INDICES_OUT_OPERATION,
     UPDATE_DECODE_GRAPH_METADATA_OPERATION,
     WRITE_FP8_KV_OPERATION,
     CONVERT_XQA_PAGES_OPERATION,
 )
+
+
+def write_int8_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slots: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    key_scales: torch.Tensor,
+    value_scales: torch.Tensor,
+) -> None:
+    """Quantize and scatter K/V and their dynamic scales to contiguous BNSD pages."""
+    WRITE_INT8_KV_OPERATION.get_prepared().function(key, value, slots, key_pages, value_pages, key_scales, value_scales)
 
 
 def has_shared_full_indices_out() -> bool:
