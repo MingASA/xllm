@@ -136,6 +136,17 @@ NNODES=2
 
 Run `xllm serve` once. The launcher assigns ranks and per-rank ports, writes `log/node_0.log`, `log/node_1.log`, and so on, and stays in the foreground. Do not pass `--node_rank` or wrap the command in a per-device loop.
 
+### INT8 KV cache on Ascend 910C
+
+For autoregressive models with ordinary causal GQA, use these options in the launch command above. They select the Python executor, enable resident signed INT8 pages, and schedule each initial prompt in full.
+
+```bash
+--model_impl=python --npu_kernel_backend=TORCH --kv_cache_dtype=int8 \
+--enable_chunked_prefill=false --enable_prefix_cache=false
+```
+
+Use `--enable_graph=false` for eager execution or `--enable_graph=true --python_graph_backend=aclgraph` for captured decode. Keep `--block_size=128` for the initial comparison and set `--kv_cache_dtype=auto` for the model-precision baseline. K and V each have one FP32 scale per token and KV head. On hybrid models, convolution and recurrent states retain their configured precision and share the cache budget with the GQA pages.
+
 ## Verify the service
 
 In another shell, wait for model loading to finish and query the rank-0 service (port `8010` in this example):

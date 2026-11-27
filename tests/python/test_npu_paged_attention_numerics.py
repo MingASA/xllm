@@ -1589,6 +1589,8 @@ def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
     ]
     scales = [torch.full((num_pages, kv_heads, page), -11.0, device=device) for _ in range(2)]
     backend.bind_kv_caches([LayerCache(*caches, key_scale=scales[0], value_scale=scales[1])])
+    with pytest.raises(ValueError, match="complete initial prompts"):
+        backend.prepare(SimpleNamespace(is_chunked_prefill=True))
     layer = SimpleNamespace(layer_id=0)
 
     def step(counts: list[int], lengths: list[int], prefill: bool) -> tuple[torch.Tensor, ...]:

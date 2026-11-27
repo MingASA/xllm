@@ -45,6 +45,9 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
                 raise ValueError("INT8 GQA requires contiguous FP32 scale pages shaped [block, head, token]")
 
     def prepare(self, metadata: AttentionMetadata, *, graph_mode: bool = False) -> None:
+        # A scheduling policy can request a chunk even when the startup flag is off.
+        if metadata.is_chunked_prefill:
+            raise ValueError("Ascend INT8 paged GQA requires complete initial prompts or single-token decode")
         super().prepare(metadata, graph_mode=graph_mode)
         self._bulk_indices = None
         slots = self._full_slot_mapping(metadata)

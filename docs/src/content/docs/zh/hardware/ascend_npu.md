@@ -136,6 +136,17 @@ NNODES=2
 
 只需执行一次 `xllm serve`。启动器自动分配 rank 和各 rank 的端口，将日志写入 `log/node_0.log`、`log/node_1.log` 等文件，并在前台运行。不要传入 `--node_rank` 或再套一层按设备启动的循环。
 
+### Ascend 910C 上的 INT8 KV Cache
+
+对于使用普通因果 GQA 的自回归模型，在上述启动命令中设置以下选项。Python 执行器将 K/V 常驻存为有符号 INT8，并完整调度每条请求的首次 prefill。
+
+```bash
+--model_impl=python --npu_kernel_backend=TORCH --kv_cache_dtype=int8 \
+--enable_chunked_prefill=false --enable_prefix_cache=false
+```
+
+使用 `--enable_graph=false` 运行 Eager，或使用 `--enable_graph=true --python_graph_backend=aclgraph` 捕获 decode。初次对照可沿用 `--block_size=128`，将 `--kv_cache_dtype` 改成 `auto` 即可测量模型原始精度。K 和 V 分别为每个 token 的每个 KV head 保存一个 FP32 尺度。混合模型的卷积和递归状态沿用配置中的精度，并与 GQA 页共享缓存预算。
+
 ## 验证服务
 
 在另一个 shell 中，等待模型加载完成后查询 rank 0 的服务（本例端口为 `8010`）：
