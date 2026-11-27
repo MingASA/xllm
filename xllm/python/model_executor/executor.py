@@ -160,6 +160,29 @@ def _create_attention_backend(
         )
     if current_platform.is_npu():
         dcp_group = distributed.dcp_group(device)
+        if config.get("kv_cache_dtype") == "int8" and not config.get("enable_mla", False):
+            from xllm.python.attention.npu_int8_attention import NpuInt8AttentionBackend
+
+            if current_platform.get_ascend_soc_generation() != "a3":
+                raise ValueError("Dense INT8 KV requires Ascend 910C")
+            if graph_backend not in _DISABLED_GRAPH_BACKENDS or config.get("num_speculative_tokens", 0):
+                raise ValueError("Dense INT8 KV requires eager autoregressive execution")
+            if config.get("enable_chunked_prefill") or config.get("enable_prefix_cache"):
+                raise ValueError("Disable chunked prefill and prefix cache for eager INT8 KV")
+            if int(config.get("cp_size", 1)) != 1 or (dcp_group is not None and dcp_group.size() > 1):
+                raise ValueError("Dense INT8 KV requires local attention pages")
+            if not first_attention.causal or first_attention.sliding_window > 0:
+                raise ValueError("Dense INT8 KV requires causal full attention")
+            return NpuInt8AttentionBackend(
+                num_heads=first_attention.num_heads,
+                num_kv_heads=first_attention.num_kv_heads,
+                head_dim=first_attention.head_dim,
+                scale=first_attention.scale,
+                sliding_window=first_attention.sliding_window,
+                is_mla=False,
+                device=device,
+                dtype=dtype,
+            )
         if (
             dcp_group is not None
             and dcp_group.size() > 1

@@ -348,11 +348,9 @@ IndexedKVCacheTensors create_indexed_kv_cache_tensors(
 QuantizedKVCacheTensors create_quantized_kv_cache_tensors(
     const KVCacheShape& kv_cache_shape,
     const KVCacheCreateOptions& create_options) {
-#if !defined(USE_MLU)
-  // SFA C8 uses indexed byte storage; this generic factory keeps the
-  // conventional key/value scale contract and is only supported on MLU.
+#if !defined(USE_MLU) && !defined(USE_NPU)
   CHECK(!create_options.enable_kv_cache_quant())
-      << util::kNonMluKvCacheQuantRejectMsg;
+      << util::kUnsupportedInt8KvCacheMsg;
 #endif
 
   QuantizedKVCacheTensors tensors;
@@ -361,26 +359,21 @@ QuantizedKVCacheTensors create_quantized_kv_cache_tensors(
   tensors.kv_cache_tensors =
       create_kv_cache_tensors(kv_cache_shape, quantized_options);
 
-  const std::vector<int64_t>& key_cache_shape =
-      kv_cache_shape.key_cache_shape();
-  std::vector<int64_t> key_scale_shape(key_cache_shape.begin(),
-                                       key_cache_shape.end() - 1);
-
-  // float32 scale tensor for quantized KV cache (int8)
-  tensors.key_cache_scale = alloc_cache_tensor(KVCacheTensorRole::KEY_SCALE,
-                                               key_scale_shape,
-                                               torch::kFloat32,
-                                               create_options);
-  if (!kv_cache_shape.value_cache_shape().empty()) {
-    const std::vector<int64_t>& value_cache_shape =
-        kv_cache_shape.value_cache_shape();
-    std::vector<int64_t> value_scale_shape(value_cache_shape.begin(),
-                                           value_cache_shape.end() - 1);
-    tensors.value_cache_scale =
-        alloc_cache_tensor(KVCacheTensorRole::VALUE_SCALE,
-                           value_scale_shape,
-                           torch::kFloat32,
-                           create_options);
+  auto allocate_scale = [&](KVCacheTensorRole role,
+                            const std::vector<int64_t>& page_shape) {
+    std::vector<int64_t> shape(page_shape.begin(), page_shape.end() - 1);
+#if defined(USE_NPU)
+    // FIA antiquant mode 5 addresses FP32 scales as [block, KV head, token].
+    CHECK_EQ(shape.size(), 3);
+    std::swap(shape[1], shape[2]);
+#endif
+    return alloc_cache_tensor(role, shape, torch::kFloat32, create_options);
+  };
+  tensors.key_cache_scale = allocate_scale(KVCacheTensorRole::KEY_SCALE,
+                                           kv_cache_shape.key_cache_shape());
+  if (kv_cache_shape.has_value_cache_shape()) {
+    tensors.value_cache_scale = allocate_scale(
+        KVCacheTensorRole::VALUE_SCALE, kv_cache_shape.value_cache_shape());
   }
 
   return tensors;

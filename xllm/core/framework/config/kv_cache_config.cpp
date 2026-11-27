@@ -58,7 +58,8 @@ DEFINE_string(kv_cache_dtype,
               "KV cache data type for quantization. \"auto\" (default): KV "
               "cache dtype aligns with model dtype (no quantization). "
               "\"int8\": Enables INT8 quantization on MLU, and on NPU for "
-              "GLM-5.2 SFA packed KV cache. CUDA Python Executor additionally "
+              "GLM-5.2 SFA packed KV cache or Ascend 910C eager Python GQA. "
+              "CUDA Python Executor additionally "
               "supports native fp8_e4m3 compressed pages.");
 
 DEFINE_string(indexer_cache_dtype,

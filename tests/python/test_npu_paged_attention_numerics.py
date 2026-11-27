@@ -1562,3 +1562,67 @@ def test_refreshed_attention_hidden_matches_reexecuted_first_body(draft_width: i
             torch.testing.assert_close(key[sequence, : prefix + committed, 0].cpu(), expected_keys, rtol=0, atol=0)
             torch.testing.assert_close(value[sequence, : prefix + committed, 0].cpu(), expected_values, rtol=0, atol=0)
     torch.npu.synchronize()
+
+
+@pytest.mark.parametrize("dimension", [128, 256])
+@torch.inference_mode()
+def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
+    from xllm.python.attention.backend import LayerCache
+    from xllm.python.attention.npu_int8_attention import NpuInt8AttentionBackend
+    from xllm.python.platform import current_platform
+
+    if current_platform.get_ascend_soc_generation() != "a3":
+        pytest.skip("requires Ascend 910C paged per-token/head antiquantization")
+
+    device = torch.device("npu:0")
+    heads, kv_heads, page = 24, 4, 128
+    backend = NpuInt8AttentionBackend(heads, kv_heads, dimension, dimension**-0.5, 0, False, device, torch.bfloat16)
+    caches = [torch.full((6, page, kv_heads, dimension), -11, dtype=torch.int8, device=device) for _ in range(2)]
+    scales = [torch.full((6, kv_heads, page), -11.0, device=device) for _ in range(2)]
+    backend.bind_kv_caches([LayerCache(*caches, key_scale=scales[0], value_scale=scales[1])])
+    blocks = [[4, 2], [3, 1]]
+    layer = SimpleNamespace(layer_id=0)
+    rng = torch.Generator().manual_seed(2026)
+
+    def step(counts: list[int], lengths: list[int], prefill: bool) -> tuple[torch.Tensor, ...]:
+        slots = [
+            row[pos // page] * page + pos % page
+            for row, count, length in zip(blocks, counts, lengths)
+            for pos in range(length - count, length)
+        ]
+        ends = list(accumulate(counts, initial=0))
+        metadata = SimpleNamespace(
+            slot_mapping=torch.tensor(slots, dtype=torch.int32, device=device),
+            block_table=torch.tensor(blocks, dtype=torch.int32, device=device),
+            q_seq_lens=torch.tensor(counts, dtype=torch.int32, device=device),
+            q_cu_seq_lens=torch.tensor(ends, dtype=torch.int32, device=device),
+            q_cu_seq_lens_host_values=ends,
+            kv_seq_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+            kv_seq_lens_host_values=lengths,
+            is_prefill=prefill,
+            is_chunked_prefill=False,
+            has_kv_shard=False,
+            expanded_decode_metadata=None,
+        )
+        backend.prepare(metadata)
+        packed = torch.randn((sum(counts), heads + 2 * kv_heads, dimension), generator=rng).bfloat16()
+        query, key, value = packed.to(device).split([heads, kv_heads, kv_heads], 1)
+        output = backend.execute(query.flatten(1), key.flatten(1), value.flatten(1), layer)
+        return *(tensor.float().cpu() for tensor in (query, key, value)), output.view_as(query).float().cpu()
+
+    lengths = [132, 73]
+    _, keys, values, prefill_output = step(lengths, lengths, True)
+    query, new_keys, new_values, decode_output = step([1, 1], [length + 1 for length in lengths], False)
+    start = 0
+    for row, length in enumerate(lengths):
+        torch.testing.assert_close(prefill_output[start], values[start].repeat_interleave(heads // kv_heads, 0))
+        history_k = torch.cat([keys[start : start + length], new_keys[row : row + 1]])
+        history_v = torch.cat([values[start : start + length], new_values[row : row + 1]])
+        weights = torch.einsum("hd,shd->hs", query[row], history_k.repeat_interleave(heads // kv_heads, 1))
+        reference = torch.einsum(
+            "hs,shd->hd", (weights * dimension**-0.5).softmax(-1), history_v.repeat_interleave(heads // kv_heads, 1)
+        )
+        torch.testing.assert_close(decode_output[row], reference, rtol=0.025, atol=0.014)
+        start += length
+    for tensor in [*caches, *scales]:
+        assert torch.all(tensor[0] == -11).item()

@@ -84,10 +84,7 @@ inline bool enable_mla_packed_c8(bool enable_kv_cache_quant,
 #endif
 }
 
-// Shared message for the three sites that reject non-MLU KV-cache quant. Kept
-// as one string so the sites cannot drift apart.
-inline constexpr const char* kNonMluKvCacheQuantRejectMsg =
-    "KV cache quantization on non-MLU backends only supports GLM-5.2 "
-    "MLA SFA C8 (model_type=glm_moe_dsa).";
+inline constexpr const char* kUnsupportedInt8KvCacheMsg =
+    "INT8 KV cache requires MLU or a supported Ascend attention backend.";
 
 }  // namespace xllm::util

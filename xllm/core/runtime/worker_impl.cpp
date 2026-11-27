@@ -391,13 +391,20 @@ void WorkerImpl::allocate_kv_cache_storage(const KVCacheShape& kv_cache_shape,
   }
 
   if (enable_kv_cache_quant) {
-#if !defined(USE_MLU)
-    // GLM-5.2 SFA C8 is the only MLA path plumbed for packed int8 KV cache on
-    // non-MLU backends. Anything else on non-MLU still hard-fails.
-    if (!util::enable_mla_packed_c8(enable_kv_cache_quant, args.model_type())) {
-      LOG(FATAL) << util::kNonMluKvCacheQuantRejectMsg << " got \""
-                 << args.model_type() << "\".";
+#if defined(USE_NPU)
+    if (!util::enable_mla_packed_c8(true, args.model_type())) {
+      CHECK(!args.enable_mla() && !enable_lighting_indexer &&
+            ModelConfig::is_python_model_impl(
+                ModelConfig::get_instance().model_impl()))
+          << "Dense INT8 KV cache requires ordinary Python attention on "
+             "Ascend.";
+      CHECK(!::xllm::KVCacheConfig::get_instance().enable_vmm_kvcache() &&
+            !options_.enable_kvcache_store() &&
+            options_.host_blocks_factor() <= 1.0)
+          << "Dense INT8 KV cache requires resident KV pages and scales.";
     }
+#elif !defined(USE_MLU)
+    LOG(FATAL) << util::kUnsupportedInt8KvCacheMsg;
 #endif
     // Check for unsupported scenarios
     if (options_.backend() == "vlm") {

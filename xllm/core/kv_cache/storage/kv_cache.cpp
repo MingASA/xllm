@@ -49,10 +49,14 @@ std::unique_ptr<KVCacheImpl> create_kv_cache_impl(
   }
 
   const bool mla_packed_c8 = create_options.mla_packed_c8();
-#if !defined(USE_MLU)
-  // Packed SFA C8 is the supported NPU KV quantization path.
-  CHECK(!create_options.enable_kv_cache_quant() || mla_packed_c8)
-      << util::kNonMluKvCacheQuantRejectMsg;
+#if defined(USE_NPU)
+  CHECK(!create_options.enable_kv_cache_quant() || mla_packed_c8 ||
+        (!util::is_mla_model_type(create_options.model_type()) &&
+         !create_options.enable_lighting_indexer()))
+      << util::kUnsupportedInt8KvCacheMsg;
+#elif !defined(USE_MLU)
+  CHECK(!create_options.enable_kv_cache_quant())
+      << util::kUnsupportedInt8KvCacheMsg;
 #endif
 
   const bool is_linear_layer =

@@ -92,6 +92,8 @@ class LayerCache:
     shared_conv_scratch_row: int | None = None
     shared_ssm_scratch_row: int | None = None
     shared_full_read_padding_page: int | None = None
+    key_scale: torch.Tensor | None = None
+    value_scale: torch.Tensor | None = None
 
     @property
     def index_scale(self) -> torch.Tensor | None:
