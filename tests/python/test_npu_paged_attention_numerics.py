@@ -1632,3 +1632,84 @@ def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
         start += length
     for tensor in [*caches, *scales]:
         assert torch.all(tensor[0] == -11).item()
+
+
+@torch.inference_mode()
+def test_int8_decode_graph_refreshes_pages_and_scales(monkeypatch: pytest.MonkeyPatch) -> None:
+    from xllm.python.attention.backend import LayerCache
+    from xllm.python.attention.npu_int8_attention import NpuInt8AttentionBackend
+    from xllm.python.attention.paged_kv_metadata import build_row_aligned_paged_kv_metadata
+    from xllm.python.model_executor.runners.acl_graph import StaticGraphAttentionMetadata
+    from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
+    from xllm.python.platform import current_platform
+
+    if current_platform.get_ascend_soc_generation() != "a3":
+        pytest.skip("requires Ascend 910C paged per-token/head antiquantization")
+    monkeypatch.setattr("xllm.python.model_executor.runners.acl_graph._GRAPH_POOL", None)
+    device = torch.device("npu:0")
+    heads, kv_heads, dim, page, blocks = 12, 2, 256, 128, 13
+    rng = torch.Generator().manual_seed(8109)
+    initial_pages = [
+        torch.randint(-60, 61, (blocks, kv_heads, page, dim), dtype=torch.int8, generator=rng) for _ in range(2)
+    ]
+    initial_scales = [torch.rand((blocks, kv_heads, page), generator=rng) * 0.04 for _ in range(2)]
+    layer = SimpleNamespace(layer_id=0)
+
+    class Layer(torch.nn.Module):
+        def __init__(self, backend: NpuInt8AttentionBackend) -> None:
+            super().__init__()
+            self.backend = backend
+
+        def forward(
+            self, input_ids: torch.Tensor, positions: torch.Tensor, input_embedding: torch.Tensor
+        ) -> torch.Tensor:
+            q, k, v = input_embedding.split([heads * dim, kv_heads * dim, kv_heads * dim], dim=-1)
+            return self.backend.execute(q, k, v, layer)
+
+    def setup():
+        backend = NpuInt8AttentionBackend(heads, kv_heads, dim, dim**-0.5, 0, False, device, torch.bfloat16)
+        cache = LayerCache(
+            *(x.to(device).transpose(1, 2) for x in initial_pages),
+            key_scale=initial_scales[0].to(device),
+            value_scale=initial_scales[1].to(device),
+        )
+        backend.bind_kv_caches([cache])
+        return Layer(backend), cache
+
+    eager, eager_cache = setup()
+    captured, graph_cache = setup()
+    graph = DecodeAclGraphRunner(captured, captured.backend, device, 4, 3 * page)
+    graph.bind_layer_caches([graph_cache])
+
+    def inputs(rows, lengths, write):
+        table = torch.tensor(rows, dtype=torch.int32, device=device)
+        slots = [row[(n - 1) // page] * page + (n - 1) % page if write else -1 for row, n in zip(rows, lengths)]
+        n = len(rows)
+        ids = torch.zeros(n, dtype=torch.int32, device=device)
+        qkv = torch.randn(n, (heads + 2 * kv_heads) * dim, generator=rng).bfloat16().to(device)
+        indptr, indices, last = build_row_aligned_paged_kv_metadata(table, lengths, page)
+        meta = StaticGraphAttentionMetadata(
+            slot_mapping=torch.tensor(slots, dtype=torch.int32, device=device),
+            block_table=table,
+            kv_seq_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+            kv_seq_lens_host_values=lengths,
+            q_seq_lens=torch.ones_like(ids),
+            q_cu_seq_lens=torch.arange(n + 1, dtype=torch.int32, device=device),
+            q_cu_seq_lens_host_values=list(range(n + 1)),
+            paged_kv_indptr=indptr,
+            paged_kv_indices=indices,
+            paged_kv_last_page_len=last,
+        )
+        return ids, qkv, meta
+
+    rows = [[4, 6, 1], [2, 7, 8], [5, 3, 9], [10, 12, 11]]
+    ids, qkv, meta = inputs(rows, [7] * 4, False)
+    graph.warmup(ids, ids, meta, qkv, is_graph_warmup=True)
+    for tables, lengths in ((rows[:3], [127, 129, 5]), (rows[::-1], [259, 7, 142, 384]), (rows[1:], [128, 1, 260])):
+        ids, qkv, meta = inputs(tables, lengths, True)
+        eager.backend.prepare(meta)
+        reference = eager(ids, ids, qkv)
+        actual = graph.execute(ids, ids, meta, qkv)
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for name in ("key", "value", "key_scale", "value_scale"):
+        torch.testing.assert_close(getattr(graph_cache, name), getattr(eager_cache, name), rtol=0, atol=0)

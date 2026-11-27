@@ -165,10 +165,10 @@ def _create_attention_backend(
 
             if current_platform.get_ascend_soc_generation() != "a3":
                 raise ValueError("Dense INT8 KV requires Ascend 910C")
-            if graph_backend not in _DISABLED_GRAPH_BACKENDS or config.get("num_speculative_tokens", 0):
-                raise ValueError("Dense INT8 KV requires eager autoregressive execution")
+            if graph_backend not in (*_DISABLED_GRAPH_BACKENDS, "aclgraph") or config.get("num_speculative_tokens", 0):
+                raise ValueError("Dense INT8 KV requires autoregressive eager or ACL graph execution")
             if config.get("enable_chunked_prefill") or config.get("enable_prefix_cache"):
-                raise ValueError("Disable chunked prefill and prefix cache for eager INT8 KV")
+                raise ValueError("Disable chunked prefill and prefix cache for dense INT8 KV")
             if int(config.get("cp_size", 1)) != 1 or (dcp_group is not None and dcp_group.size() > 1):
                 raise ValueError("Dense INT8 KV requires local attention pages")
             if not first_attention.causal or first_attention.sliding_window > 0:

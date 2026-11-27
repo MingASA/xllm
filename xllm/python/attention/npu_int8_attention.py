@@ -1,5 +1,5 @@
 # Copyright 2026 The xLLM Authors. Licensed under Apache-2.0.
-"""Eager GQA with paged INT8 K/V and per-token, per-head dequantization scales."""
+"""Ascend GQA with paged INT8 K/V and per-token, per-head dequantization scales."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from xllm_kernel.ops.quantization import dynamic_quant
 
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.npu_paged_attention import SPARSE_MODE_RIGHT_DOWN_CAUSAL, NpuPagedAttentionBackend
+from xllm.python.model_executor.forward_context import borrow_acl_graph_tensor, get_forward_context_or_none
 
 if TYPE_CHECKING:
     from xllm.python.attention.backend import AttentionMetadata
@@ -57,6 +58,34 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
             heads = torch.arange(self.num_kv_heads, device=slots.device, dtype=slots.dtype)
             first = slots + (slots // self.page_size) * ((self.num_kv_heads - 1) * self.page_size)
             self._bulk_indices = live, (first[:, None] + heads * self.page_size).reshape(-1).int()
+
+    def _fia_options(self, cache: LayerCache) -> dict:
+        return dict(
+            input_layout="BNSD",
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            scale=self.scale,
+            block_size=self.page_size,
+            key_antiquant_scale=cache.key_scale,
+            value_antiquant_scale=cache.value_scale,
+            key_antiquant_mode=5,
+            value_antiquant_mode=5,
+        )
+
+    def _allocate_graph_workspace(
+        self, graph_batch_size: int, block_table: torch.Tensor, *, actual_seq_kv: list[int] | torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # All full-attention layers have the same page and scale descriptors.
+        cache = next(cache for cache in self._kv_caches if cache.key is not None)
+        query = torch.empty(graph_batch_size, self.num_heads, 1, self.head_dim, device=self.device, dtype=self.dtype)
+        return self._fused_attention.workspace(
+            query=query,
+            key=cache.key.transpose(1, 2),
+            value=cache.value.transpose(1, 2),
+            block_table=block_table,
+            actual_seq_lengths_kv=self._actual_seq_kv if actual_seq_kv is None else actual_seq_kv,
+            **self._fia_options(cache),
+        )
 
     def execute(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: Attention) -> torch.Tensor:
         metadata = self._metadata
@@ -110,20 +139,39 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
                 actual_seq_lengths_kv=ends,
             )
         else:
-            output, _ = self._fused_attention(
-                query.unsqueeze(2),
-                key_pages,
-                value_pages,
-                input_layout="BNSD",
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                scale=self.scale,
-                block_size=self.page_size,
-                block_table=self._block_table_i32,
-                actual_seq_lengths_kv=self._actual_seq_kv,
-                key_antiquant_scale=cache.key_scale,
-                value_antiquant_scale=cache.value_scale,
-                key_antiquant_mode=5,
-                value_antiquant_mode=5,
-            )
+            query = query.unsqueeze(2)
+            options = self._fia_options(cache)
+            context = get_forward_context_or_none()
+            if context is None or context.execution_state is None:
+                output, _ = self._fused_attention(
+                    query,
+                    key_pages,
+                    value_pages,
+                    block_table=self._block_table_i32,
+                    actual_seq_lengths_kv=self._actual_seq_kv,
+                    **options,
+                )
+            else:
+                state = self._paged_graph_state
+                if state is None:
+                    raise RuntimeError("INT8 decode graph requires prepared FIA workspace")
+                output = state.output.view_as(query) if state.output is not None else torch.empty_like(query)
+                capture = context.acl_graph
+                borrow = capture is not None and state.output is None
+                options.update(
+                    block_table=state.block_table,
+                    actual_seq_lengths_kv=state.kv,
+                    workspace=state.workspace,
+                    out=[borrow_acl_graph_tensor(output) if borrow else output, state.lse],
+                )
+                if capture is None:
+                    self._fused_attention.out(query, key_pages, value_pages, **options)
+                else:
+                    capture.capture_task(
+                        self._fused_attention.out,
+                        borrow_acl_graph_tensor(query) if borrow else query,
+                        key_pages,
+                        value_pages,
+                        **options,
+                    )
         return output.reshape(q.shape[0], self.num_heads * self.head_dim)
