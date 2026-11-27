@@ -199,6 +199,7 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   // These values belong to the executor, not the checkpoint. In particular,
   // the MTP draft has different speculative options from its target.
   py::dict executor_config = py_causal_lm_->config_dict().attr("copy")();
+  executor_config["kv_cache_dtype"] = options_.kv_cache_dtype();
   executor_config["enable_disagg_pd"] = options_.enable_disagg_pd();
   executor_config["instance_role"] = options_.instance_role().to_string();
   executor_config["task_type"] = options_.task_type();

@@ -396,6 +396,7 @@ class DecodeCudaGraphRunner(BaseRunner):
                 # metadata. Using seq_len=1 dummy sequences would schedule the
                 # padding rows as real decode work and add unnecessary overhead.
                 entry.host_seq_lens[batch_size:padded_batch_size].zero_()
+            static_metadata.kv_seq_lens_host = entry.host_seq_lens
             torch.add(
                 entry.host_seq_lens,
                 page_size - 1,

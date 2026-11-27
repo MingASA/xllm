@@ -55,7 +55,10 @@ def initialize_runtime() -> None:
     from xllm.python.platform import current_platform
 
     if current_platform.is_cuda():
-        _load_kernel_package().initialize(device="cuda", operations=("partial_rotary_embedding",))
+        operations = ("partial_rotary_embedding",)
+        if find_spec("triton") is not None:
+            operations += ("write_fp8_kv", "quantize_query_fp8", "convert_xqa_pages")
+        _load_kernel_package().initialize(device="cuda", operations=operations)
         backend_name = "xllm.python.kernels_cuda"
     elif current_platform.is_npu():
         xllm_kernel = _load_kernel_package()

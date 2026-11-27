@@ -53,8 +53,8 @@ def initialize(
     Environment overrides take precedence over the mapping. Repeating the same
     effective configuration returns the same read-only mapping. A policy change
     requires a new worker, and forward execution never reselects or falls back.
-    By default all catalog operations are required. Models and standalone tools
-    can declare a subset so unused collectives do not require a process group.
+    Defaults include all operations with an adapter for this platform. Models and
+    standalone tools can request a subset to avoid loading unused collectives.
     """
     global _prepared, _configuration
     platform = Platform.enum() if device is None else PlatformEnum(device)
@@ -65,20 +65,21 @@ def initialize(
         catalog = load_operations()
         names = tuple(op.contract.operation for op in catalog)
         choices = resolve_overrides(names, overrides)
-        requested = names if operations is None else operations
+        supported = tuple(op.contract.operation for op in catalog if any(b.platform == platform for b in op.backends))
+        requested = supported if operations is None else operations
         if not requested or len(set(requested)) != len(requested) or set(requested) - set(names):
             raise ValueError(f"invalid kernel operation set: {requested!r}")
         if set(overrides or {}) - set(requested):
             raise ValueError("kernel overrides must target requested operations")
         selected = tuple(op for op in catalog if op.contract.operation in requested)
+        if set(requested) - set(supported):
+            raise ValueError(f"kernel catalog does not provide all required operation adapters for {device!r}")
         choices = {name: value for name, value in choices.items() if name in requested}
         configuration = (device, execution_mode, tuple(sorted(requested)), tuple(sorted(choices.items())))
         if _prepared is not None:
             if configuration != _configuration:
                 raise RuntimeError("xllm_kernel is already initialized; restart the worker to change kernel policy")
             return _prepared
-        if any(not any(b.platform == platform for b in op.backends) for op in selected):
-            raise ValueError(f"kernel catalog does not provide all required operation adapters for {device!r}")
 
         unavailable: dict[str, tuple[tuple[str, str], ...]] = {}
         for operation in selected:
