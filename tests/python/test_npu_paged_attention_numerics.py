@@ -1717,8 +1717,9 @@ def test_int8_decode_graph_refreshes_pages_and_scales(monkeypatch: pytest.Monkey
         torch.testing.assert_close(getattr(graph_cache, name), getattr(eager_cache, name), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(("batch", "heads", "dim", "gap"), [(32, 2, 256, 0), (7, 3, 96, 2)])
 @torch.inference_mode()
-def test_int8_graph_writer_preserves_eager_rounding() -> None:
+def test_int8_graph_writer_preserves_eager_rounding(batch: int, heads: int, dim: int, gap: int) -> None:
     from xllm_kernel.ops.kv_cache import write_int8_kv
 
     from xllm.python.platform import current_platform
@@ -1727,10 +1728,10 @@ def test_int8_graph_writer_preserves_eager_rounding() -> None:
         pytest.skip("requires Ascend 910C INT8 cache writes")
 
     device = torch.device("npu:0")
-    key, value = [torch.zeros(32, 2, 256, dtype=torch.bfloat16, device=device) for _ in range(2)]
-    slots = torch.arange(32, device=device, dtype=torch.int32)
-    pages = [torch.empty((2, 2, 128, 256), dtype=torch.int8, device=device) for _ in range(2)]
-    pages += [torch.empty((2, 2, 128), dtype=torch.float32, device=device) for _ in range(2)]
+    key, value = [torch.zeros(batch, heads + gap, dim, dtype=torch.bfloat16, device=device)[:, gap:] for _ in range(2)]
+    slots = torch.arange(batch, device=device, dtype=torch.int32)
+    pages = [torch.empty((2, heads, 128, dim), dtype=torch.int8, device=device) for _ in range(2)]
+    pages += [torch.empty((2, heads, 128), dtype=torch.float32, device=device) for _ in range(2)]
     reference = [torch.empty_like(page) for page in pages]
     write_int8_kv(key, value, slots, *reference)
     graph = torch.npu.NPUGraph()
@@ -1738,12 +1739,13 @@ def test_int8_graph_writer_preserves_eager_rounding() -> None:
         write_int8_kv(key, value, slots, *pages)
 
     # These BF16 peaks distinguish an IEEE division from multiplication by a rounded reciprocal.
-    peaks = torch.tensor([143, 144, 175, 207, 208, 239, 254, 0], dtype=torch.float32).repeat(4) / 128
-    data = (torch.linspace(-1, 1, 256) * peaks[:, None]).bfloat16().to(device)
+    peaks = torch.tensor([143, 144, 175, 207, 208, 239, 254, 0], dtype=torch.float32) / 128
+    peaks = peaks[torch.arange(batch * heads).reshape(batch, heads) % peaks.numel()]
+    data = (torch.linspace(-1, 1, dim) * peaks[:, :, None]).bfloat16().to(device)
     for step in (0, 1):
-        key.copy_(data.roll(step, 0)[:, None, :])
+        key.copy_(data.roll(step, 0))
         value.copy_(-key.roll(1, 0))
-        slots.copy_((torch.arange(32, dtype=torch.int32) * 7 + 41 * step) % 256)
+        slots.copy_((torch.arange(batch, dtype=torch.int32) * 7 + 41 * step) % 256)
         slots[-2:] = -1
         for page in (*reference, *pages):
             page.fill_(-117)
