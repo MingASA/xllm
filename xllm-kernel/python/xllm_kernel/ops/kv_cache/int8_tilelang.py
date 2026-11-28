@@ -27,13 +27,16 @@ def _prepare_writer(page: int, heads: int, dim: int, key_stride: int, value_stri
     blocks = T.symbolic("blocks")
     key_rows = T.symbolic("key_rows")
     value_rows = T.symbolic("value_rows")
+    packed = key_stride == value_stride == heads
+    k_shape = (tokens, heads, dim) if packed else (key_rows, dim)
+    v_shape = (tokens, heads, dim) if packed else (value_rows, dim)
     tiles = tokens * head_groups
     groups = T.min(VECTOR_CORES // 2, T.ceildiv(tiles, 2))
 
     @T.prim_func
     def write(
-        key: T.Tensor((key_rows, dim), "bfloat16"),
-        value: T.Tensor((value_rows, dim), "bfloat16"),
+        key: T.Tensor(k_shape, "bfloat16"),
+        value: T.Tensor(v_shape, "bfloat16"),
         slots: T.Tensor((tokens,), "int32"),
         kp: T.Tensor((blocks, heads, page, dim), "int8"),
         vp: T.Tensor((blocks, heads, page, dim), "int8"),
@@ -61,7 +64,12 @@ def _prepare_writer(page: int, heads: int, dim: int, key_stride: int, value_stri
                     slot = slots[token]
                     if slot >= 0 and slot < blocks * page:
                         for component in T.serial(2):
-                            if component == 0:
+                            if packed:
+                                if component == 0:
+                                    T.copy(key[token, first_head : first_head + tile_heads, :], source)
+                                else:
+                                    T.copy(value[token, first_head : first_head + tile_heads, :], source)
+                            elif component == 0:
                                 row = token * key_stride + first_head
                                 T.copy(key[row : row + tile_heads, :], source)
                             else:
@@ -133,12 +141,13 @@ if current_platform.get_ascend_soc_generation() == "a3":
         ):
             tokens, heads, dim = key.shape
             k_stride, v_stride = key.stride(0) // dim, value.stride(0) // dim
-            # The TileLang binding takes contiguous tensors. View the physical row span
-            # so fused QKV projections can retain their outer stride without a copy.
-            key_rows = key.as_strided(((tokens - 1) * k_stride + heads, dim), (dim, 1))
-            value_rows = value.as_strided(((tokens - 1) * v_stride + heads, dim), (dim, 1))
+            if k_stride != heads or v_stride != heads:
+                # The binding requires contiguous descriptors. View the physical span
+                # of strided QKV projections without copying their logical rows.
+                key = key.as_strided(((tokens - 1) * k_stride + heads, dim), (dim, 1))
+                value = value.as_strided(((tokens - 1) * v_stride + heads, dim), (dim, 1))
             _prepare_writer(key_pages.size(2), heads, dim, k_stride, v_stride)(
-                key_rows, value_rows, slots, key_pages, value_pages, key_scales, value_scales, 127.0
+                key, value, slots, key_pages, value_pages, key_scales, value_scales, 127.0
             )
         else:
             _triton_write(*args)
