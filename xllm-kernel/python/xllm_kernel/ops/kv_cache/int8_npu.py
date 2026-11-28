@@ -65,6 +65,73 @@ def _write_int8_head(
             tl.store(value_scales + row, scale)
 
 
+@triton.jit
+def _copy_quantized_rows(
+    indices,
+    key,
+    value,
+    key_scales,
+    value_scales,
+    key_pages,
+    value_pages,
+    key_scale_pages,
+    value_scale_pages,
+    num_rows,
+    dim: tl.constexpr,
+    channels: tl.constexpr,
+    tile_rows: tl.constexpr,
+):
+    row = tl.program_id(0) * tile_rows + tl.arange(0, tile_rows)
+    channel = tl.arange(0, channels)
+    live = row < num_rows
+    dest = tl.load(indices + row, live, 0).to(tl.int64)
+    valid = live[:, None] & (channel[None, :] < dim)
+    src_offset = row[:, None].to(tl.int64) * dim + channel[None, :]
+    dst_offset = dest[:, None] * dim + channel[None, :]
+    k = tl.load(key + src_offset, valid, 0)
+    v = tl.load(value + src_offset, valid, 0)
+    ks = tl.load(key_scales + row, live, 0)
+    vs = tl.load(value_scales + row, live, 0)
+    tl.store(key_pages + dst_offset, k, valid)
+    tl.store(value_pages + dst_offset, v, valid)
+    tl.store(key_scale_pages + dest, ks, live)
+    tl.store(value_scale_pages + dest, vs, live)
+
+
+def copy_quantized_kv(
+    indices: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_scales: torch.Tensor,
+    value_scales: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    key_scale_pages: torch.Tensor,
+    value_scale_pages: torch.Tensor,
+) -> None:
+    """Scatter contiguous CANN DynamicQuant rows and FP32 scales to their physical FIA rows."""
+    dim = key.size(-1)
+    rows = indices.numel()
+    channels = triton.next_power_of_2(dim)
+    # Limit the vector tile to 8 KiB per INT8 input for wide KV heads.
+    tile_rows = min(32, max(1, 8192 // channels))
+    _copy_quantized_rows[(triton.cdiv(rows, tile_rows),)](
+        indices,
+        key,
+        value,
+        key_scales,
+        value_scales,
+        key_pages,
+        value_pages,
+        key_scale_pages,
+        value_scale_pages,
+        rows,
+        dim,
+        channels,
+        tile_rows,
+    )
+
+
 @register_kernel(
     name="npu.triton.write_int8_kv",
     platform=PlatformEnum.NPU,

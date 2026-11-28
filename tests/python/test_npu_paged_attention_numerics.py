@@ -1593,7 +1593,9 @@ def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
         backend.prepare(SimpleNamespace(is_chunked_prefill=True))
     layer = SimpleNamespace(layer_id=0)
 
-    def step(counts: list[int], lengths: list[int], prefill: bool) -> tuple[torch.Tensor, ...]:
+    def step(
+        counts: list[int], lengths: list[int], prefill: bool, replacement_slots: list[int] | None = None
+    ) -> tuple[torch.Tensor, ...]:
         slots = [
             row[pos // page] * page + pos % page
             for row, count, length in zip(blocks, counts, lengths)
@@ -1601,7 +1603,9 @@ def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
         ]
         ends = list(accumulate(counts, initial=0))
         metadata = SimpleNamespace(
-            slot_mapping=torch.tensor(slots, dtype=torch.int32, device=device),
+            slot_mapping=torch.tensor(
+                slots if replacement_slots is None else replacement_slots, dtype=torch.int32, device=device
+            ),
             block_table=torch.tensor(blocks, dtype=torch.int32, device=device),
             q_seq_lens=torch.tensor(counts, dtype=torch.int32, device=device),
             q_cu_seq_lens=torch.tensor(ends, dtype=torch.int32, device=device),
@@ -1634,6 +1638,27 @@ def test_int8_gqa_eager_paged_decode(dimension: int) -> None:
         start += length
     for tensor in [*caches, *scales]:
         assert torch.all(tensor[0] == -11).item()
+
+    if sum(lengths) * kv_heads >= 4096:
+        # Bulk prefill still attends all prompt tokens when padding omits their cache writes.
+        for valid in (False, True):
+            for tensor in [*caches, *scales]:
+                tensor.fill_(-11)
+            slots = [-1] * sum(lengths)
+            if valid:
+                slots[0], slots[-1] = num_pages * page, 19
+            _, _, values, output = step(lengths, lengths, True, slots)
+            torch.testing.assert_close(output[0], values[0].repeat_interleave(heads // kv_heads, 0))
+            for tensor in caches:
+                if valid:
+                    assert (tensor[0, 19] != -11).any().item()
+                    tensor[0, 19].fill_(-11)
+                assert (tensor == -11).all().item()
+            for tensor in scales:
+                if valid:
+                    assert (tensor[0, :, 19] > 0).all().item()
+                    tensor[0, :, 19].fill_(-11)
+                assert (tensor == -11).all().item()
 
 
 @torch.inference_mode()

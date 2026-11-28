@@ -6,8 +6,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch_npu
-from xllm_kernel.ops.kv_cache import reshape_paged_cache, write_int8_kv
+from xllm_kernel.ops.kv_cache import write_int8_kv
+from xllm_kernel.ops.kv_cache.int8_npu import copy_quantized_kv
 from xllm_kernel.ops.quantization import dynamic_quant
 
 from xllm.python.attention.backend import LayerCache
@@ -53,14 +53,17 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
         slots = self._full_slot_mapping(metadata)
         # At 4096 token/head rows CANN's bulk quantization overtakes the scalar scatter.
         if metadata.is_prefill and slots.numel() * self.num_kv_heads >= 4096:
-            live = torch.where(slots >= 0)[0]
+            capacity = self.num_kv_blocks * self.page_size
+            live = torch.where((slots >= 0) & (slots < capacity))[0]
             if live.numel() == slots.numel():
                 live = None
             else:
                 slots = slots.index_select(0, live)
+            if capacity * self.num_kv_heads > 2**31 - 1:
+                slots = slots.long()
             heads = torch.arange(self.num_kv_heads, device=slots.device, dtype=slots.dtype)
             first = slots + (slots // self.page_size) * ((self.num_kv_heads - 1) * self.page_size)
-            self._bulk_indices = live, (first[:, None] + heads * self.page_size).reshape(-1).int()
+            self._bulk_indices = live, (first[:, None] + heads * self.page_size).reshape(-1)
 
     def _fia_options(self, cache: LayerCache) -> dict:
         return dict(
@@ -115,15 +118,7 @@ class NpuInt8AttentionBackend(NpuPagedAttentionBackend):
             if indices.numel():
                 ki, ks = dynamic_quant(key if live is None else key.index_select(0, live))
                 vi, vs = dynamic_quant(value if live is None else value.index_select(0, live))
-                reshape_paged_cache(
-                    indices,
-                    ki.view(-1, 1, self.head_dim),
-                    vi.view(-1, 1, self.head_dim),
-                    key_pages.view(-1, self.page_size, 1, self.head_dim),
-                    value_pages.view(-1, self.page_size, 1, self.head_dim),
-                )
-                torch_npu.npu_scatter_nd_update_(cache.key_scale.view(-1), indices[:, None], ks.flatten())
-                torch_npu.npu_scatter_nd_update_(cache.value_scale.view(-1), indices[:, None], vs.flatten())
+                copy_quantized_kv(indices, ki, vi, ks, vs, key_pages, value_pages, cache.key_scale, cache.value_scale)
 
         if metadata.is_prefill:
             # The whole prompt is present in model precision before the first decode.
